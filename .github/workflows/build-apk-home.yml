@@ -1,0 +1,388 @@
+name: Build APK
+on: [workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir HomeQuota && cd HomeQuota
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'QEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.homequota"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.homequota"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.work:work-runtime-ktx:2.9.0")
+              implementation("androidx.core:core-ktx:1.13.1")
+          }
+          QEOF
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'QEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <application
+                  android:label="حصة البيت"
+                  android:supportsRtl="true"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          QEOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/homequota/Alerts.kt')"
+          cat > 'app/src/main/java/com/example/homequota/Alerts.kt' <<'QEOF'
+          package com.example.homequota
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.content.Context
+          import androidx.work.Worker
+          import androidx.work.WorkerParameters
+
+          object Notifier {
+              /** يبعت تنبيه مرة واحدة عند ٨٠٪ ومرة عند ١٠٠٪ لكل جهاز. */
+              fun check(c: Context, l: List<Dev>) {
+                  val nm = c.getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel("quota", "تنبيهات الحصة", NotificationManager.IMPORTANCE_DEFAULT)
+                  )
+                  for (d in l) {
+                      val p = if (d.quotaMB > 0) d.usedMB / d.quotaMB * 100 else 0.0
+                      val level = if (p >= 100) 100 else if (p >= 80) 80 else 0
+                      if (level > d.alert) {
+                          val msg = if (level == 100) "${d.name} خلّص حصته الشهرية" else "${d.name} وصل ٨٠٪ من حصته"
+                          nm.notify(
+                              d.mac.hashCode(),
+                              Notification.Builder(c, "quota")
+                                  .setSmallIcon(android.R.drawable.stat_sys_warning)
+                                  .setContentTitle("حصة البيت")
+                                  .setContentText(msg).build()
+                          )
+                      }
+                      d.alert = level
+                  }
+                  Store.save(c, l)
+              }
+          }
+
+          class SyncWorker(ctx: Context, params: WorkerParameters) : Worker(ctx, params) {
+              override fun doWork(): Result = try {
+                  val l = Store.apply(applicationContext, Routers.current().fetch(applicationContext))
+                  Notifier.check(applicationContext, l)
+                  Result.success()
+              } catch (e: Exception) { Result.retry() }
+          }
+          QEOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/homequota/MainActivity.kt')"
+          cat > 'app/src/main/java/com/example/homequota/MainActivity.kt' <<'QEOF'
+          package com.example.homequota
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.res.ColorStateList
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.os.Build
+          import android.os.Bundle
+          import android.text.InputType
+          import android.view.View
+          import android.widget.*
+          import androidx.work.*
+          import java.util.concurrent.TimeUnit
+
+          class MainActivity : Activity() {
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  if (Build.VERSION.SDK_INT >= 33)
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  schedule()
+              }
+
+              override fun onResume() { super.onResume(); render(Store.load(this)) }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun tv(t: String, size: Float = 16f, bold: Boolean = false, gray: Boolean = false) =
+                  TextView(this).apply {
+                      text = t; textSize = size; setPadding(0, dp(3), 0, dp(3))
+                      if (bold) setTypeface(typeface, Typeface.BOLD)
+                      if (gray) setTextColor(Color.GRAY)
+                  }
+
+              private fun fmt(mb: Double): String {
+                  val big = mb >= 1024
+                  val n = if (big) mb / 1024 else mb
+                  return String.format("%.2f", n).trimEnd('0').trimEnd('.') + if (big) " جيجا" else " ميجا"
+              }
+
+              private fun color(p: Double) = when {
+                  p >= 100 -> Color.parseColor("#D9480F")
+                  p >= 80 -> Color.parseColor("#E08A00")
+                  else -> Color.parseColor("#2A55E5")
+              }
+
+              private fun bar(p: Double) =
+                  ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                      max = 1000
+                      progress = (p * 10).toInt().coerceIn(0, 1000)
+                      progressTintList = ColorStateList.valueOf(color(p))
+                  }
+
+              private fun render(l: List<Dev>) {
+                  val q = l.sumOf { it.quotaMB }
+                  val u = l.sumOf { it.usedMB }
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(18), dp(36), dp(18), dp(24))
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  }
+                  col.addView(tv("حصة البيت", 14f, gray = true))
+                  col.addView(tv(if (l.isEmpty()) "لسه مفيش أجهزة. اضغط تحديث." else "استهلكنا ${fmt(u)} من ${fmt(q)}", 24f, true))
+                  col.addView(bar(if (q > 0) u / q * 100 else 0.0))
+                  l.forEach { d ->
+                      val p = if (d.quotaMB > 0) d.usedMB / d.quotaMB * 100 else 0.0
+                      val card = LinearLayout(this).apply {
+                          orientation = LinearLayout.VERTICAL
+                          setPadding(0, dp(14), 0, dp(4))
+                          setOnClickListener { edit(d, l) }
+                      }
+                      card.addView(tv(d.name, 17f, true))
+                      card.addView(tv("${d.ip} · ${d.mac}", 12f, gray = true))
+                      card.addView(tv("${fmt(d.usedMB)} من ${fmt(d.quotaMB)}"))
+                      card.addView(bar(p))
+                      col.addView(card)
+                  }
+                  col.addView(Button(this).apply { text = "حدّث الآن"; setOnClickListener { refresh() } })
+                  col.addView(Button(this).apply { text = "ابدأ دورة جديدة"; setOnClickListener { confirmReset() } })
+                  setContentView(ScrollView(this).apply { addView(col) })
+              }
+
+              private fun refresh() {
+                  Toast.makeText(this, "بيحدّث...", Toast.LENGTH_SHORT).show()
+                  Thread {
+                      try {
+                          val l = Store.apply(this, Routers.current().fetch(this))
+                          Notifier.check(this, l)
+                          runOnUiThread { render(l) }
+                      } catch (e: Exception) {
+                          runOnUiThread { Toast.makeText(this, "فشل التحديث: ${e.message}", Toast.LENGTH_LONG).show() }
+                      }
+                  }.start()
+              }
+
+              private fun edit(d: Dev, l: List<Dev>) {
+                  val name = EditText(this).apply { setText(d.name) }
+                  val q = EditText(this).apply {
+                      setText((d.quotaMB / 1024).toString())
+                      hint = "الحصة بالجيجا"
+                      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                  }
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(8), dp(20), 0)
+                      addView(name); addView(q)
+                  }
+                  AlertDialog.Builder(this).setTitle("تعديل الجهاز").setView(box)
+                      .setPositiveButton("حفظ") { _, _ ->
+                          d.name = name.text.toString().ifBlank { d.name }
+                          q.text.toString().toDoubleOrNull()?.let { if (it >= 0) d.quotaMB = it * 1024 }
+                          d.alert = 0
+                          Store.save(this, l)
+                          render(l)
+                      }.setNegativeButton("إلغاء", null).show()
+              }
+
+              private fun confirmReset() {
+                  AlertDialog.Builder(this).setTitle("دورة جديدة؟")
+                      .setMessage("هيتصفّر استهلاك كل الأجهزة وتفضل الحصص زي ما هي.")
+                      .setPositiveButton("تصفير") { _, _ ->
+                          Store.resetCycle(this)
+                          render(Store.load(this))
+                      }.setNegativeButton("إلغاء", null).show()
+              }
+
+              private fun schedule() {
+                  val req = PeriodicWorkRequestBuilder<SyncWorker>(15, TimeUnit.MINUTES)
+                      .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+                      .build()
+                  WorkManager.getInstance(this)
+                      .enqueueUniquePeriodicWork("sync", ExistingPeriodicWorkPolicy.KEEP, req)
+              }
+          }
+          QEOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/homequota/Model.kt')"
+          cat > 'app/src/main/java/com/example/homequota/Model.kt' <<'QEOF'
+          package com.example.homequota
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          /** جهاز في البيت. المفتاح هو عنوان MAC لأن الأيبي بيتغير. */
+          data class Dev(
+              val mac: String, var name: String, var ip: String,
+              var quotaMB: Double, var usedMB: Double, var alert: Int = 0
+          )
+
+          /** قراءة جاية من الراوتر: استهلاك الجهاز (ميجا) من بداية الشهر. */
+          data class Reading(val mac: String, val name: String, val ip: String, val usedMB: Double)
+
+          object Store {
+              private fun p(c: Context) = c.getSharedPreferences("hq", 0)
+
+              fun load(c: Context): MutableList<Dev> {
+                  val a = JSONArray(p(c).getString("devs", "[]"))
+                  return MutableList(a.length()) {
+                      val o = a.getJSONObject(it)
+                      Dev(o.getString("mac"), o.getString("name"), o.optString("ip"),
+                          o.getDouble("q"), o.getDouble("u"), o.optInt("a"))
+                  }
+              }
+
+              fun save(c: Context, l: List<Dev>) {
+                  val a = JSONArray()
+                  l.forEach {
+                      a.put(JSONObject().put("mac", it.mac).put("name", it.name).put("ip", it.ip)
+                          .put("q", it.quotaMB).put("u", it.usedMB).put("a", it.alert))
+                  }
+                  p(c).edit().putString("devs", a.toString()).apply()
+              }
+
+              /** يدمج قراءات الراوتر مع الأجهزة المحفوظة (الحصة الافتراضية ١٠ جيجا). */
+              fun apply(c: Context, r: List<Reading>): MutableList<Dev> {
+                  val l = load(c)
+                  for (x in r) {
+                      val d = l.find { it.mac == x.mac }
+                          ?: Dev(x.mac, x.name, x.ip, 10 * 1024.0, 0.0).also { l.add(it) }
+                      d.ip = x.ip
+                      d.usedMB = x.usedMB
+                      if (d.name.isBlank()) d.name = x.name
+                  }
+                  save(c, l)
+                  return l
+              }
+
+              fun resetCycle(c: Context) {
+                  val l = load(c)
+                  l.forEach { it.usedMB = 0.0; it.alert = 0 }
+                  save(c, l)
+                  Routers.current().resetCounters(c)
+              }
+          }
+          QEOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/homequota/Router.kt')"
+          cat > 'app/src/main/java/com/example/homequota/Router.kt' <<'QEOF'
+          package com.example.homequota
+
+          import android.content.Context
+          import org.json.JSONObject
+          import kotlin.random.Random
+
+          /**
+           * ده الجزء اللي تعدّله حسب راوترك.
+           * اعمل كلاس جديد يطبّق RouterClient، واقرأ فيه من الراوتر (HTTP / SNMP / سكربت OpenWrt)
+           * استهلاك كل جهاز من بداية الشهر، ورجّعه كقائمة Reading. بعدين غيّر Routers.current().
+           * ملاحظة: الاتصال بالشبكة لازم يكون في الخلفية (مش على الـ UI thread) والتطبيق بيعمل كده أصلًا.
+           */
+          interface RouterClient {
+              fun fetch(ctx: Context): List<Reading>
+              /** يتنادى عند بدء دورة جديدة (لو الراوتر محتاج تصفير أو baseline). */
+              fun resetCounters(ctx: Context) {}
+          }
+
+          object Routers {
+              fun current(): RouterClient = DemoRouterClient()
+          }
+
+          /** قراءة تجريبية: أجهزة وهمية بيزيد استهلاكها مع كل تحديث. */
+          class DemoRouterClient : RouterClient {
+              private val devs = listOf(
+                  Triple("AA:BB:CC:00:00:01", "موبايل أحمد", "192.168.1.101"),
+                  Triple("AA:BB:CC:00:00:02", "لابتوب", "192.168.1.102"),
+                  Triple("AA:BB:CC:00:00:03", "تلفزيون الصالة", "192.168.1.103"),
+                  Triple("AA:BB:CC:00:00:04", "تابلت", "192.168.1.104")
+              )
+
+              private fun prefs(c: Context) = c.getSharedPreferences("demo", 0)
+
+              override fun fetch(ctx: Context): List<Reading> {
+                  val o = JSONObject(prefs(ctx).getString("used", "{}")!!)
+                  val out = devs.map { (mac, name, ip) ->
+                      val u = o.optDouble(mac, 0.0) + Random.nextDouble(20.0, 400.0)
+                      o.put(mac, u)
+                      Reading(mac, name, ip, u)
+                  }
+                  prefs(ctx).edit().putString("used", o.toString()).apply()
+                  return out
+              }
+
+              override fun resetCounters(ctx: Context) {
+                  prefs(ctx).edit().putString("used", "{}").apply()
+              }
+          }
+          QEOF
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'QEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          QEOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'QEOF'
+          android.useAndroidX=true
+          QEOF
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'QEOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "HomeQuota"
+          include(":app")
+          QEOF
+
+      - name: Build
+        working-directory: HomeQuota
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HomeQuota-apk
+          path: HomeQuota/app/build/outputs/apk/debug/app-debug.apk
